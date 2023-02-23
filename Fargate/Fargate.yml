@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: "MySQL RDS DB"
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+  DBInstanceIdentifier:
+    Type: String
+    Default: "website-test"
+
+Resources:
+
+  LBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "LB Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: LBSecurityGroup
+    Properties:
+      GroupDescription: "Fargate Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          SourceSecurityGroupId: !Ref LBSecurityGroup
+
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: FargateSecurityGroup
+    Properties:
+      GroupDescription: "ElastiCache Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref FargateSecurityGroup
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: FargateSecurityGroup
+    Properties:
+      GroupDescription: "RDS Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          SourceSecurityGroupId: !Ref FargateSecurityGroup
+
+  TestSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: "Secrets for dev environment"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  TestDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties: 
+      DBSubnetGroupDescription: "RDS subnet group"
+      SubnetIds: 
+        - !Ref Subnet1
+        - !Ref Subnet2
+    
+        
+  TestDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      AllocatedStorage: "20"
+      DBInstanceClass: db.t3.micro
+      DBSubnetGroupName: !Ref TestDBSubnetGroup
+      Engine: mysql
+      EngineVersion: "5.7.38"
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref CORETestSecrets, ':SecretString:username}}']]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref CORETestSecrets, ':SecretString:password}}']]
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      MonitoringInterval: 60
+      MonitoringRoleArn: arn:aws:iam::892725010566:role/rds-monitoring-role
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "13:00-13:30"
+      PreferredMaintenanceWindow: "mon:14:00-mon:14:30"
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      PubliclyAccessible: true
+
