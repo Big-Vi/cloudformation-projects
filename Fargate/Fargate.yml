@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
-Description: "MySQL RDS DB"
+Description: "Launching SilverStripe in ECS Fargate"
 
 Parameters:
   VPC:
@@ -11,14 +11,23 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
   DBInstanceIdentifier:
     Type: String
-    Default: "website-test"
+  Image:
+    Type: String
+    Default: "<ACCOUNT_ID>.dkr.ecr.ap-southeast-2.amazonaws.com/<IMAGE_NAME>"
+  ServiceName:
+    Type: String
+  Certificate:
+    Type: String
+  HostedZoneName:
+    Type: String
+  Subdomain:
+    Type: String
 
 Resources:
-
   LBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: "LB Security Group"
+      GroupDescription: "Website LB Security Group"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -34,7 +43,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     DependsOn: LBSecurityGroup
     Properties:
-      GroupDescription: "Fargate Security Group"
+      GroupDescription: "Website Fargate Security Group"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: "-1"
@@ -44,7 +53,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     DependsOn: FargateSecurityGroup
     Properties:
-      GroupDescription: "ElastiCache Security Group"
+      GroupDescription: "Website Elasti Cache Security Group"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -56,30 +65,19 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     DependsOn: FargateSecurityGroup
     Properties:
-      GroupDescription: "RDS Security Group"
+      GroupDescription: "Website RDS Security Group"
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: "-1"
           SourceSecurityGroupId: !Ref FargateSecurityGroup
 
-  TestSecrets:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Description: "Secrets for dev environment"
-      GenerateSecretString:
-        SecretStringTemplate: '{"username": "admin"}'
-        GenerateStringKey: "password"
-        PasswordLength: 16
-        ExcludeCharacters: '"@/\'
-
   TestDBSubnetGroup:
     Type: "AWS::RDS::DBSubnetGroup"
     Properties: 
-      DBSubnetGroupDescription: "RDS subnet group"
+      DBSubnetGroupDescription: "Website test subnet group"
       SubnetIds: 
         - !Ref Subnet1
         - !Ref Subnet2
-    
         
   TestDatabase:
     Type: AWS::RDS::DBInstance
@@ -90,12 +88,13 @@ Resources:
       DBSubnetGroupName: !Ref TestDBSubnetGroup
       Engine: mysql
       EngineVersion: "5.7.38"
-      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref CORETestSecrets, ':SecretString:username}}']]
-      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref CORETestSecrets, ':SecretString:password}}']]
+      DBName: "{{resolve:secretsmanager:<SECRET_NAME>:SecretString:SS_DATABASE_NAME}}"
+      MasterUsername: "{{resolve:secretsmanager:<SECRET_NAME>:SecretString:SS_DATABASE_USERNAME}}"
+      MasterUserPassword: "{{resolve:secretsmanager:<SECRET_NAME>:SecretString:SS_DATABASE_PASSWORD}}"
       VPCSecurityGroups:
         - !Ref RDSSecurityGroup
       MonitoringInterval: 60
-      MonitoringRoleArn: arn:aws:iam::892725010566:role/rds-monitoring-role
+      MonitoringRoleArn: arn:aws:iam::<ACCOUNT_ID>:role/rds-monitoring-role
       BackupRetentionPeriod: 7
       PreferredBackupWindow: "13:00-13:30"
       PreferredMaintenanceWindow: "mon:14:00-mon:14:30"
@@ -103,3 +102,200 @@ Resources:
       AutoMinorVersionUpgrade: true
       PubliclyAccessible: true
 
+  ElastiSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: "Subnet group for Redis ElastiCache"
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+
+  ElastiCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.t3.micro
+      Engine: redis
+      EngineVersion: "7.0"
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref ElastiSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+      PreferredMaintenanceWindow: "mon:00:00-mon:01:00"
+      AutoMinorVersionUpgrade: true
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: "core-website-cluster"
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/"
+      HealthCheckTimeoutSeconds: 20
+      UnhealthyThresholdCount: 5
+      HealthyThresholdCount: 2
+      Name: !Join ['', [!Ref ServiceName, TargetGroup]]
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+    
+  ListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['', [!Ref ServiceName, LoadBalancer]]
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LBSecurityGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join ['', [!Ref HostedZoneName, .]]
+      Name: !Join ['', [!Ref Subdomain, ., !Ref HostedZoneName, .]]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 1
+      MaxCapacity: 5
+      ResourceId: !Join ['/', [service, !Ref ECSCluster, !GetAtt Service.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: "arn:aws:iam::973098863180:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS"
+  
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ['', [!Ref ServiceName, AutoScalingPolicy]]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        TargetValue: 50
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: ECSExecRoleForCoreWebsite
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action: 
+                - "ecs:ExecuteCommand"
+              Resource: !Ref ECSCluster
+            - Effect: Allow
+              Action:
+                - "ssmmessages:CreateControlChannel"
+                - "ssmmessages:CreateDataChannel"
+                - "ssmmessages:OpenControlChannel"
+                - "ssmmessages:OpenDataChannel"
+              Resource: "*"
+        - PolicyName: EcsSecretPermission
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+            Action:
+              - "secretsmanager:GetSecretValue"
+            Resource: 
+              - "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>"
+
+    
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: "website-td"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: "ARM64"
+        OperatingSystemFamily: "LINUX"
+      ExecutionRoleArn: !Ref ECSExecutionRole
+      TaskRoleArn: !Ref ECSExecutionRole
+      ContainerDefinitions:
+        - Image: !Ref Image
+          Name: "website"
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: "true"
+              awslogs-group: "/ecs/website"
+              awslogs-region: "ap-southeast-2"
+              awslogs-stream-prefix: "ecs"
+          Secrets:
+            - Name: SS_DATABASE_USERNAME
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_DATABASE_USERNAME::"
+            - Name: SS_DATABASE_PASSWORD
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_DATABASE_PASSWORD::"
+            - Name: SS_ENVIRONMENT_TYPE
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_ENVIRONMENT_TYPE::"
+            - Name: SS_DATABASE_NAME
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_DATABASE_NAME::"
+            - Name: SS_DEFAULT_ADMIN_USERNAME
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_DEFAULT_ADMIN_USERNAME::"
+            - Name: SS_DEFAULT_ADMIN_PASSWORD
+              ValueFrom: "arn:aws:secretsmanager:ap-southeast-2:<ACCOUNT_ID>:secret:<SECRET_NAME>:SS_DEFAULT_ADMIN_PASSWORD::"
+            - Name: SS_DATABASE_SERVER
+              ValueFrom: !GetAtt TestDatabase.Endpoint.Address
